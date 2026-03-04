@@ -140,7 +140,7 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
         mode = data.get("mode", "reg")
 
         try:
-            pending = await ctx.auth.request_login_code(phone, mode)
+            pending, delivery_hint = await ctx.auth.request_login_code(phone, mode)
         except Exception as exc:  # noqa: BLE001
             await _set_failed_event(ctx.settings.db_path, phone, f"send_code_error: {exc}")
             await message.answer(
@@ -151,10 +151,10 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
             await state.clear()
             return
 
-        await state.update_data(pending=pending.__dict__, phone=phone)
+        await state.update_data(pending=pending.__dict__, phone=phone, delivery_hint=delivery_hint)
         await state.set_state(FlowState.waiting_code)
         prompt = await message.answer(
-            "Код запрошен. Ответьте ТОЛЬКО реплаем на это сообщение и отправьте 5 цифр кода.",
+            f"Код запрошен. {delivery_hint}\nОтветьте ТОЛЬКО реплаем на это сообщение и отправьте 5 цифр кода.",
             reply_markup=code_wait_keyboard(),
         )
         await state.update_data(code_prompt_id=prompt.message_id)
@@ -169,6 +169,10 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
     async def auth_cancel(query: CallbackQuery, state: FSMContext):
         if not await _is_admin(query, ctx.settings):
             return
+        data = await state.get_data()
+        phone = data.get("phone")
+        if phone:
+            await ctx.auth.cancel_pending(phone)
         await state.clear()
         await query.message.answer("Авторизация отменена.", reply_markup=main_keyboard())
         await query.answer()
@@ -185,10 +189,10 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
 
         pending = PendingAuth(**pending_dict)
         try:
-            pending = await ctx.auth.resend_login_code(pending)
-            await state.update_data(pending=pending.__dict__)
+            pending, delivery_hint = await ctx.auth.resend_login_code(pending)
+            await state.update_data(pending=pending.__dict__, delivery_hint=delivery_hint)
             await query.message.answer(
-                "🔁 Код запрошен повторно (SMS). Ответьте реплаем на сообщение с запросом кода."
+                f"🔁 Код запрошен повторно. {delivery_hint}\nОтветьте реплаем на сообщение с запросом кода."
             )
         except Exception as exc:  # noqa: BLE001
             await _set_failed_event(ctx.settings.db_path, pending.phone, f"resend_code_error: {exc}")
@@ -227,6 +231,7 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
                 pending.mode,
                 ctx.auth._session_path(pending.phone),
             )
+            await ctx.auth.cancel_pending(pending.phone)
             await message.answer(f"✅ {result}", reply_markup=main_keyboard())
             await state.clear()
         else:
@@ -252,6 +257,7 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
                 pending.mode,
                 ctx.auth._session_path(pending.phone),
             )
+            await ctx.auth.cancel_pending(pending.phone)
             await message.answer(f"✅ {result}", reply_markup=main_keyboard())
             await state.clear()
         else:
