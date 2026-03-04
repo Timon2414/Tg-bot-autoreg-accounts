@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -88,6 +89,14 @@ def add_type_keyboard():
     return kb.as_markup()
 
 
+def code_wait_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔁 Отправить код повторно", callback_data="auth:resend")
+    kb.button(text="❌ Отмена", callback_data="auth:cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 async def create_dispatcher(ctx: AppContext) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
 
@@ -130,17 +139,61 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
         data = await state.get_data()
         mode = data.get("mode", "reg")
 
-        pending = await ctx.auth.request_login_code(phone, mode)
-        await state.update_data(pending=pending.__dict__)
+        try:
+            pending = await ctx.auth.request_login_code(phone, mode)
+        except Exception as exc:  # noqa: BLE001
+            await _set_failed_event(ctx.settings.db_path, phone, f"send_code_error: {exc}")
+            await message.answer(
+                f"❌ Не удалось запросить код у Telegram: {exc}\n"
+                "Проверьте формат номера (+7999...), api_id/api_hash и попробуйте еще раз.",
+                reply_markup=main_keyboard(),
+            )
+            await state.clear()
+            return
+
+        await state.update_data(pending=pending.__dict__, phone=phone)
         await state.set_state(FlowState.waiting_code)
+        prompt = await message.answer(
+            "Код запрошен. Ответьте ТОЛЬКО реплаем на это сообщение и отправьте 5 цифр кода.",
+            reply_markup=code_wait_keyboard(),
+        )
+        await state.update_data(code_prompt_id=prompt.message_id)
 
         if mode == "noreg":
             await message.answer(
                 "Режим 'не рег': для официальной регистрации с email/tempmail.ninja нужен внешний GUI-автоматизатор Windows. "
                 "Сейчас запрошен код входа через Telegram API. Отправьте код из Telegram/SMS."
             )
-        else:
-            await message.answer("Код отправлен. Ответьте сообщением с кодом.")
+
+    @dp.callback_query(F.data == "auth:cancel")
+    async def auth_cancel(query: CallbackQuery, state: FSMContext):
+        if not await _is_admin(query, ctx.settings):
+            return
+        await state.clear()
+        await query.message.answer("Авторизация отменена.", reply_markup=main_keyboard())
+        await query.answer()
+
+    @dp.callback_query(F.data == "auth:resend")
+    async def auth_resend(query: CallbackQuery, state: FSMContext):
+        if not await _is_admin(query, ctx.settings):
+            return
+        data = await state.get_data()
+        pending_dict = data.get("pending")
+        if not pending_dict:
+            await query.answer("Нет активной авторизации", show_alert=True)
+            return
+
+        pending = PendingAuth(**pending_dict)
+        try:
+            pending = await ctx.auth.resend_login_code(pending)
+            await state.update_data(pending=pending.__dict__)
+            await query.message.answer(
+                "🔁 Код запрошен повторно (SMS). Ответьте реплаем на сообщение с запросом кода."
+            )
+        except Exception as exc:  # noqa: BLE001
+            await _set_failed_event(ctx.settings.db_path, pending.phone, f"resend_code_error: {exc}")
+            await query.message.answer(f"❌ Не удалось запросить код повторно: {exc}")
+        await query.answer()
 
     @dp.message(FlowState.waiting_code)
     async def receive_code(message: Message, state: FSMContext):
@@ -154,8 +207,19 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
             await state.clear()
             return
 
+        prompt_id = data.get("code_prompt_id")
+        reply_id = message.reply_to_message.message_id if message.reply_to_message else None
+        if not prompt_id or reply_id != prompt_id:
+            await message.answer("❗️Код нужно отправлять только ответом (Reply) на сообщение с запросом кода.")
+            return
+
         pending = PendingAuth(**pending_dict)
-        ok, result = await ctx.auth.confirm_login_code(pending, code)
+        normalized_code = "".join(re.findall(r"\d", code))
+        if len(normalized_code) != 5:
+            await message.answer("❗️Код должен содержать 5 цифр. Отправьте его реплаем на сообщение с запросом кода.")
+            return
+
+        ok, result = await ctx.auth.confirm_login_code(pending, normalized_code)
         if ok:
             await _upsert_account(
                 ctx.settings.db_path,
@@ -167,7 +231,7 @@ async def create_dispatcher(ctx: AppContext) -> Dispatcher:
             await state.clear()
         else:
             await _set_failed_event(ctx.settings.db_path, pending.phone, result)
-            await state.update_data(last_code=code)
+            await state.update_data(last_code=normalized_code)
             if "2FA" in result:
                 await state.set_state(FlowState.waiting_2fa)
             await message.answer(f"❌ {result}")

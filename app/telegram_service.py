@@ -39,6 +39,19 @@ class TelegramAuthService:
         finally:
             await client.disconnect()
 
+    async def resend_login_code(self, pending: PendingAuth) -> PendingAuth:
+        client = self.build_client(pending.phone)
+        await client.connect()
+        try:
+            sent = await client.send_code_request(pending.phone, force_sms=True)
+            return PendingAuth(
+                phone=pending.phone,
+                phone_code_hash=sent.phone_code_hash,
+                mode=pending.mode,
+            )
+        finally:
+            await client.disconnect()
+
     async def confirm_login_code(
         self,
         pending: PendingAuth,
