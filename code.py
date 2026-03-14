@@ -81,6 +81,7 @@ class Storage:
                 code_value TEXT,
                 code_reported INTEGER DEFAULT 0,
                 no_code_reported INTEGER DEFAULT 0,
+                max_retry_used INTEGER DEFAULT 0,
                 reward REAL DEFAULT 0,
                 created_at INTEGER,
                 updated_at INTEGER
@@ -123,6 +124,13 @@ class Storage:
                 blocked_by INTEGER,
                 created_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS blocked_numbers_v2 (
+                phone TEXT NOT NULL,
+                service TEXT NOT NULL,
+                blocked_by INTEGER,
+                created_at INTEGER,
+                PRIMARY KEY (phone, service)
+            );
             CREATE TABLE IF NOT EXISTS admin_roles (
                 user_id INTEGER PRIMARY KEY,
                 is_junior INTEGER NOT NULL DEFAULT 1,
@@ -132,6 +140,8 @@ class Storage:
                 imo_price REAL NOT NULL DEFAULT 1.40,
                 treasury_balance REAL NOT NULL DEFAULT 0,
                 profit_total REAL NOT NULL DEFAULT 0,
+                is_paused INTEGER NOT NULL DEFAULT 0,
+                treasury_mode TEXT NOT NULL DEFAULT 'moment',
                 created_at INTEGER,
                 updated_at INTEGER
             );
@@ -151,6 +161,7 @@ class Storage:
         self._migrate_users_table()
         self._migrate_numbers_table()
         self._migrate_admin_roles_table()
+        self._migrate_blocked_numbers_table()
         defaults = {
             "price_reg": "1.5",
             "price_noreg": "1.0",
@@ -192,6 +203,8 @@ class Storage:
         if "service" not in cols:
             self.conn.execute("ALTER TABLE numbers ADD COLUMN service TEXT NOT NULL DEFAULT 'telegram'")
             self.conn.execute("UPDATE numbers SET service='telegram' WHERE service IS NULL OR service='' ")
+        if "max_retry_used" not in cols:
+            self.conn.execute("ALTER TABLE numbers ADD COLUMN max_retry_used INTEGER DEFAULT 0")
         tcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(treasury_invoices)").fetchall()}
         if "created_by" not in tcols:
             self.conn.execute("ALTER TABLE treasury_invoices ADD COLUMN created_by INTEGER DEFAULT 0")
@@ -203,6 +216,10 @@ class Storage:
             self.conn.execute("ALTER TABLE admin_roles ADD COLUMN max_price REAL NOT NULL DEFAULT 1.40")
         if "imo_price" not in cols:
             self.conn.execute("ALTER TABLE admin_roles ADD COLUMN imo_price REAL NOT NULL DEFAULT 1.40")
+        if "is_paused" not in cols:
+            self.conn.execute("ALTER TABLE admin_roles ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0")
+        if "treasury_mode" not in cols:
+            self.conn.execute("ALTER TABLE admin_roles ADD COLUMN treasury_mode TEXT NOT NULL DEFAULT 'moment'")
         access_cols = {
             "access_numbers": 1,
             "access_users": 0,
@@ -286,6 +303,23 @@ class Storage:
             return
         self.conn.execute("UPDATE users SET referrer_id=? WHERE user_id=? AND referrer_id IS NULL", (referrer_id, user_id))
         self.conn.commit()
+
+    def _migrate_blocked_numbers_table(self):
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(blocked_numbers_v2)").fetchall()}
+        if not cols:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_numbers_v2 (
+                    phone TEXT NOT NULL,
+                    service TEXT NOT NULL,
+                    blocked_by INTEGER,
+                    created_at INTEGER,
+                    PRIMARY KEY (phone, service)
+                )
+            """)
+            rows = self.conn.execute("SELECT * FROM blocked_numbers").fetchall()
+            for r in rows:
+                self.conn.execute("INSERT OR IGNORE INTO blocked_numbers_v2(phone,service,blocked_by,created_at) VALUES(?,?,?,?)", (r["phone"], "telegram", r["blocked_by"], r["created_at"]))
+            self.conn.commit()
 
     def get_setting(self, key: str) -> Optional[str]:
         r = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -375,6 +409,45 @@ class Storage:
         row = self.junior_admin_row(admin_id)
         return float(row["treasury_balance"] if row else 0.0)
 
+    def junior_is_paused(self, admin_id: int) -> bool:
+        row = self.junior_admin_row(admin_id)
+        return bool(int(row["is_paused"] or 0)) if row and "is_paused" in row.keys() else False
+
+    def set_junior_paused(self, admin_id: int, paused: bool):
+        self.conn.execute("UPDATE admin_roles SET is_paused=?,updated_at=? WHERE user_id=?", (1 if paused else 0, int(time.time()), admin_id))
+        self.conn.commit()
+
+    def junior_treasury_mode(self, admin_id: int) -> str:
+        row = self.junior_admin_row(admin_id)
+        if not row:
+            return "moment"
+        mode = str(row["treasury_mode"] or "moment") if "treasury_mode" in row.keys() else "moment"
+        return mode if mode in {"moment", "hold"} else "moment"
+
+    def set_junior_treasury_mode(self, admin_id: int, mode: str):
+        mode = mode if mode in {"moment", "hold"} else "moment"
+        self.conn.execute("UPDATE admin_roles SET treasury_mode=?,updated_at=? WHERE user_id=?", (mode, int(time.time()), admin_id))
+        self.conn.commit()
+
+    def junior_profit_day(self, admin_id: int) -> float:
+        row = self.junior_admin_row(admin_id)
+        if not row:
+            return 0.0
+        since = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+        reg_ok = self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND status='success' AND acc_type='reg' AND updated_at>=?", (admin_id, since)).fetchone()["c"]
+        noreg_ok = self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND status='success' AND acc_type='noreg' AND updated_at>=?", (admin_id, since)).fetchone()["c"]
+        max_ok = self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND status='success' AND acc_type='max' AND updated_at>=?", (admin_id, since)).fetchone()["c"]
+        imo_ok = self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND status='success' AND acc_type='imo' AND updated_at>=?", (admin_id, since)).fetchone()["c"]
+        base_reg = float(self.get_setting("price_reg") or 0)
+        base_noreg = float(self.get_setting("price_noreg") or 0)
+        base_max = float(self.get_setting("price_max") or 0)
+        base_imo = float(self.get_setting("price_imo") or 0)
+        reg_diff = max(0.0, float(row["reg_price"]) - base_reg)
+        noreg_diff = max(0.0, float(row["noreg_price"]) - base_noreg)
+        max_diff = max(0.0, float(row["max_price"]) - base_max)
+        imo_diff = max(0.0, float(row["imo_price"]) - base_imo)
+        return float(reg_ok) * reg_diff + float(noreg_ok) * noreg_diff + float(max_ok) * max_diff + float(imo_ok) * imo_diff
+
     def add_junior_treasury_balance(self, admin_id: int, amount: float):
         self.conn.execute(
             "UPDATE admin_roles SET treasury_balance=treasury_balance+?,updated_at=? WHERE user_id=?",
@@ -414,7 +487,9 @@ class Storage:
         self.conn.commit()
 
     def add_number(self, user_id: int, phone: str, acc_type: str, service: str = "telegram"):
-        service = service if service in {"telegram", "max", "imo"} else "telegram"
+        service = service if service in {"telegram", "telegram_reg", "telegram_noreg", "max", "imo"} else "telegram"
+        if service in {"telegram_reg", "telegram_noreg"}:
+            service = "telegram"
         now = int(time.time())
         self.conn.execute(
             "INSERT INTO numbers(user_id,phone,acc_type,service,status,queue_entered_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -422,9 +497,10 @@ class Storage:
         )
         self.conn.commit()
 
-    def _pending_ordered(self, service: Optional[str] = None):
+    def _pending_ordered(self, queue_key: Optional[str] = None):
         now = int(time.time())
-        if service in {"max", "imo"}:
+        queue_key = queue_key or "telegram_reg"
+        if queue_key in {"max", "imo"}:
             return self.conn.execute(
                 """
                 SELECT n.id FROM numbers n
@@ -432,20 +508,21 @@ class Storage:
                 WHERE n.status='pending' AND n.service=?
                 ORDER BY n.queue_entered_at, n.id
                 """,
-                (service,),
+                (queue_key,),
             ).fetchall()
+        tg_type = "reg" if queue_key == "telegram_reg" else "noreg"
         return self.conn.execute(
             """
             SELECT n.id FROM numbers n
             JOIN users u ON u.user_id=n.user_id
-            WHERE n.status='pending' AND n.service='telegram'
+            WHERE n.status='pending' AND n.service='telegram' AND n.acc_type=?
             ORDER BY CASE WHEN u.vip_until>? THEN 0 ELSE 1 END, n.queue_entered_at, n.id
             """,
-            (now,),
+            (tg_type, now),
         ).fetchall()
 
-    def pending_position(self, number_id: int, service: Optional[str] = None) -> Optional[int]:
-        for idx, row in enumerate(self._pending_ordered(service), 1):
+    def pending_position(self, number_id: int, queue_key: Optional[str] = None) -> Optional[int]:
+        for idx, row in enumerate(self._pending_ordered(queue_key), 1):
             if row["id"] == number_id:
                 return idx
         return None
@@ -492,23 +569,37 @@ class Storage:
         self.conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, user_id))
         self.conn.commit()
 
-    def get_pending_for_admin(self, limit: int = 5, offset: int = 0, service: str = "telegram"):
-        service = service if service in {"telegram", "max", "imo"} else "telegram"
+    def get_pending_for_admin(self, limit: int = 5, offset: int = 0, queue_key: str = "telegram_reg"):
         now = int(time.time())
+        if queue_key in {"max", "imo"}:
+            return self.conn.execute(
+                """
+                SELECT n.*,u.username,u.vip_until FROM numbers n
+                LEFT JOIN users u ON u.user_id=n.user_id
+                WHERE n.status='pending' AND n.service=?
+                ORDER BY n.queue_entered_at,n.id
+                LIMIT ? OFFSET ?
+                """,
+                (queue_key, limit, offset),
+            ).fetchall()
+        tg_type = "reg" if queue_key == "telegram_reg" else "noreg"
         return self.conn.execute(
             """
             SELECT n.*,u.username,u.vip_until FROM numbers n
             LEFT JOIN users u ON u.user_id=n.user_id
-            WHERE n.status='pending' AND n.service=?
+            WHERE n.status='pending' AND n.service='telegram' AND n.acc_type=?
             ORDER BY CASE WHEN u.vip_until>? THEN 0 ELSE 1 END, n.queue_entered_at,n.id
             LIMIT ? OFFSET ?
             """,
-            (service, now, limit, offset),
+            (tg_type, now, limit, offset),
         ).fetchall()
 
-    def pending_count(self, service: Optional[str] = None) -> int:
-        if service in {"telegram", "max", "imo"}:
-            return int(self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='pending' AND service=?", (service,)).fetchone()["c"])
+    def pending_count(self, queue_key: Optional[str] = None) -> int:
+        if queue_key in {"max", "imo"}:
+            return int(self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='pending' AND (service=? OR (? in ('telegram_reg','telegram_noreg') AND service='telegram'))", (queue_key,)).fetchone()["c"])
+        if queue_key in {"telegram_reg", "telegram_noreg"}:
+            tg_type = "reg" if queue_key == "telegram_reg" else "noreg"
+            return int(self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='pending' AND service='telegram' AND acc_type=?", (tg_type,)).fetchone()["c"])
         return int(self.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='pending'").fetchone()["c"])
 
     def clear_pending_queue(self) -> int:
@@ -628,22 +719,45 @@ class Storage:
         now = int(time.time())
         return self.conn.execute("SELECT * FROM users WHERE vip_until>? ORDER BY vip_until DESC", (now,)).fetchall()
 
-    def is_phone_blocked(self, phone: str) -> bool:
-        return self.conn.execute("SELECT 1 FROM blocked_numbers WHERE phone=?", (phone,)).fetchone() is not None
+    def is_phone_blocked(self, phone: str, service: Optional[str] = None) -> bool:
+        if service in {"telegram", "telegram_reg", "telegram_noreg", "max", "imo"}:
+            if service in {"telegram_reg", "telegram_noreg"}:
+                service = "telegram"
+            return self.conn.execute("SELECT 1 FROM blocked_numbers_v2 WHERE phone=? AND service=?", (phone, service)).fetchone() is not None
+        return self.conn.execute("SELECT 1 FROM blocked_numbers_v2 WHERE phone=?", (phone,)).fetchone() is not None
 
-    def block_phone(self, phone: str, admin_id: int):
+    def block_phone(self, phone: str, admin_id: int, service: str = "telegram"):
+        service = service if service in {"telegram", "telegram_reg", "telegram_noreg", "max", "imo"} else "telegram"
+        if service in {"telegram_reg", "telegram_noreg"}:
+            service = "telegram"
         self.conn.execute(
-            "INSERT INTO blocked_numbers(phone,blocked_by,created_at) VALUES(?,?,?) ON CONFLICT(phone) DO UPDATE SET blocked_by=excluded.blocked_by,created_at=excluded.created_at",
-            (phone, admin_id, int(time.time())),
+            "INSERT INTO blocked_numbers_v2(phone,service,blocked_by,created_at) VALUES(?,?,?,?) ON CONFLICT(phone,service) DO UPDATE SET blocked_by=excluded.blocked_by,created_at=excluded.created_at",
+            (phone, service, admin_id, int(time.time())),
         )
         self.conn.commit()
 
-    def unblock_phone(self, phone: str):
-        self.conn.execute("DELETE FROM blocked_numbers WHERE phone=?", (phone,))
+    def unblock_phone(self, phone: str, service: Optional[str] = None):
+        if service in {"telegram", "telegram_reg", "telegram_noreg", "max", "imo"}:
+            if service in {"telegram_reg", "telegram_noreg"}:
+                service = "telegram"
+            self.conn.execute("DELETE FROM blocked_numbers_v2 WHERE phone=? AND service=?", (phone, service))
+        else:
+            self.conn.execute("DELETE FROM blocked_numbers_v2 WHERE phone=?", (phone,))
         self.conn.commit()
 
-    def blocked_phones(self):
-        return self.conn.execute("SELECT * FROM blocked_numbers ORDER BY created_at DESC").fetchall()
+    def blocked_phones(self, service: Optional[str] = None, limit: int = 30, offset: int = 0):
+        if service in {"telegram", "telegram_reg", "telegram_noreg", "max", "imo"}:
+            if service in {"telegram_reg", "telegram_noreg"}:
+                service = "telegram"
+            return self.conn.execute("SELECT * FROM blocked_numbers_v2 WHERE service=? ORDER BY created_at DESC LIMIT ? OFFSET ?", (service, limit, offset)).fetchall()
+        return self.conn.execute("SELECT * FROM blocked_numbers_v2 ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+
+    def blocked_phones_count(self, service: Optional[str] = None) -> int:
+        if service in {"telegram", "telegram_reg", "telegram_noreg", "max", "imo"}:
+            if service in {"telegram_reg", "telegram_noreg"}:
+                service = "telegram"
+            return int(self.conn.execute("SELECT COUNT(*) c FROM blocked_numbers_v2 WHERE service=?", (service,)).fetchone()["c"])
+        return int(self.conn.execute("SELECT COUNT(*) c FROM blocked_numbers_v2").fetchone()["c"])
 
     def recent_taken_numbers(self, limit: int = 10):
         return self.conn.execute(
@@ -879,6 +993,8 @@ def has_admin_access(user_id: int, key: str) -> bool:
         return True
     if not db.is_junior_admin(user_id):
         return False
+    if db.junior_is_paused(user_id):
+        return False
     return db.junior_access(user_id, key)
 
 
@@ -928,6 +1044,7 @@ def admin_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         return ReplyKeyboardMarkup([
             ["🛠 Номера", "👥 Пользователи"],
             ["💵 Цена", "📈 Админ-статистика"],
+            ["📊 Статистика бота"],
             ["⏯ Старт/Стоп ворк", "📣 Рассылка"],
             ["🏦 Казна", "💸 Выплаты"],
             ["🔒 Блок номера", "👮 Админы"],
@@ -958,7 +1075,7 @@ def _is_treasury_text(text: str) -> bool:
 
 
 
-SERVICE_LABELS = {"telegram": "Telegram", "max": "MAX", "imo": "IMO"}
+SERVICE_LABELS = {"telegram_reg": "Telegram REG", "telegram_noreg": "Telegram NOREG", "max": "MAX", "imo": "IMO"}
 
 
 def service_for_acc_type(acc_type: str) -> str:
@@ -981,6 +1098,12 @@ def acc_type_label(acc_type: str) -> str:
     if acc_type == "imo":
         return "IMO"
     return acc_type
+
+
+def service_label(service: str) -> str:
+    if service == "telegram":
+        return "Telegram"
+    return SERVICE_LABELS.get(service, service)
 
 
 def _work_enabled_for_type(acc_type: str) -> bool:
@@ -1176,6 +1299,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_subscription(update, context, user.id):
         return
     t = _normalize_menu_text(update.message.text)
+    if context.user_data.get("mailing_mode") and t != "📣 Рассылка":
+        context.user_data.pop("mailing_mode", None)
+
     if t == "📲 Сдать номер":
         await show_submit_menu(update)
     elif t == "📋 Мои номера":
@@ -1199,6 +1325,8 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_price_menu(update)
     elif t == "📈 Админ-статистика" and has_admin_access(user.id, "stats"):
         await show_admin_stats(update)
+    elif t == "📊 Статистика бота" and is_senior_admin(user.id):
+        await show_bot_full_stats(update)
     elif t == "⏯ Старт/Стоп ворк" and has_admin_access(user.id, "work"):
         await show_work_menu(update)
     elif t == "📣 Рассылка" and has_admin_access(user.id, "mailing"):
@@ -1276,19 +1404,17 @@ async def contact_or_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added = []
     rejected = []
     for p in parsed:
-        if db.is_phone_blocked(p):
+        if db.is_phone_blocked(p, service):
             rejected.append((p, "заблокирован"))
             continue
         successful, in_progress = db.phone_status_flags(p)
-        if successful:
-            rejected.append((p, "уже успешно сдавался"))
-            continue
         if in_progress:
             rejected.append((p, "уже находится в очереди/работе"))
             continue
         db.add_number(user.id, p, acc_type, service)
         num_id = db.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-        added.append((p, db.pending_position(num_id, service)))
+        qkey = service if service in ("max", "imo") else ("telegram_reg" if acc_type == "reg" else "telegram_noreg")
+        added.append((p, db.pending_position(num_id, qkey)))
     context.user_data.pop("waiting_phone_type", None)
     parts = []
     if added:
@@ -1318,7 +1444,8 @@ async def cb_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["<b>Ваши ожидающие номера:</b>"]
         btns = []
         for r in rows:
-            pos = db.pending_position(r["id"], r["service"] if "service" in r.keys() else None)
+            qkey = r["service"] if r["service"] in ("max", "imo") else ("telegram_reg" if r["acc_type"] == "reg" else "telegram_noreg")
+            pos = db.pending_position(r["id"], qkey)
             lines.append(f"• {r['phone']} — очередь #{pos}")
             btns.append([InlineKeyboardButton(f"Удалить {r['phone']}", callback_data=f"mydel:{r['id']}")])
         await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(btns))
@@ -1366,7 +1493,7 @@ async def cb_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Недостаточно средств для вывода.")
         return
     last_ok = db.user_last_success_time(uid)
-    wait_left = 240 - (int(time.time()) - last_ok) if last_ok else 240
+    wait_left = 240 - (int(time.time()) - last_ok) if last_ok else 0
     if wait_left > 0:
         await q.message.reply_text(f"Вывод доступен через {wait_left} сек после последней успешной сдачи номера.")
         return
@@ -1473,7 +1600,8 @@ async def cb_user_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_admin_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Telegram", callback_data="admqueue:telegram:0")],
+        [InlineKeyboardButton("Telegram REG", callback_data="admqueue:telegram_reg:0")],
+        [InlineKeyboardButton("Telegram NOREG", callback_data="admqueue:telegram_noreg:0")],
         [InlineKeyboardButton("MAX", callback_data="admqueue:max:0")],
         [InlineKeyboardButton("IMO", callback_data="admqueue:imo:0")],
     ])
@@ -1486,7 +1614,7 @@ async def _render_admin_queue_msg(message, service: str, page: int, viewer_id: i
 
 
 def _admin_queue_payload(service: str, page: int, viewer_id: int):
-    service = service if service in {"telegram", "max", "imo"} else "telegram"
+    service = service if service in {"telegram_reg", "telegram_noreg", "max", "imo"} else "telegram_reg"
     total = db.pending_count(service)
     rows = db.get_pending_for_admin(5, page * 5, service)
     if not rows:
@@ -1498,7 +1626,7 @@ def _admin_queue_payload(service: str, page: int, viewer_id: int):
         [InlineKeyboardButton("📂 Сменить сервис", callback_data="admqueue:services")],
     ]
     for idx, r in enumerate(rows, 1 + page * 5):
-        vip_mark = "💎 " if int(r["vip_until"] or 0) > int(time.time()) and service == "telegram" else ""
+        vip_mark = "💎 " if int(r["vip_until"] or 0) > int(time.time()) and service in {"telegram_reg", "telegram_noreg"} else ""
         lines.append(f"{idx}. {vip_mark}{r['phone']} ({acc_type_label(r['acc_type'])}) {_queue_owner_label(viewer_id, r)}")
         kb.append([InlineKeyboardButton(f"Открыть очередь #{idx}", callback_data=f"admnum:{r['id']}")])
     nav = []
@@ -1519,13 +1647,14 @@ async def cb_admin_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     if len(parts) == 2 and parts[1] == "services":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Telegram", callback_data="admqueue:telegram:0")],
+            [InlineKeyboardButton("Telegram REG", callback_data="admqueue:telegram_reg:0")],
+            [InlineKeyboardButton("Telegram NOREG", callback_data="admqueue:telegram_noreg:0")],
             [InlineKeyboardButton("MAX", callback_data="admqueue:max:0")],
             [InlineKeyboardButton("IMO", callback_data="admqueue:imo:0")],
         ])
         await q.message.reply_text("Выберите сервис очереди:", reply_markup=kb)
         return
-    service = parts[1] if len(parts) > 1 else "telegram"
+    service = parts[1] if len(parts) > 1 else "telegram_reg"
     page = int(parts[2]) if len(parts) > 2 else 0
     await _render_admin_queue_msg(q.message, service, page, q.from_user.id)
 
@@ -1535,7 +1664,7 @@ async def _auto_queue_tick(context: ContextTypes.DEFAULT_TYPE):
     chat_id = job.data["chat_id"]
     message_id = job.data["message_id"]
     page = job.data["page"]
-    service = job.data.get("service", "telegram")
+    service = job.data.get("service", "telegram_reg")
     try:
         viewer_id = int(job.data.get("viewer_id", 0))
         text, markup = _admin_queue_payload(service, page, viewer_id)
@@ -1551,7 +1680,7 @@ async def cb_admin_clear_queue(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     parts = q.data.split(":")
     action = parts[1]
-    service = parts[2] if len(parts) > 2 else "telegram"
+    service = parts[2] if len(parts) > 2 else "telegram_reg"
     if action == "ask":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Да, очистить", callback_data=f"admclear:do:{service}")],
@@ -1563,9 +1692,13 @@ async def cb_admin_clear_queue(update: Update, context: ContextTypes.DEFAULT_TYP
         await remove_buttons(q)
         await q.message.reply_text("Очистка очереди отменена.")
         return
-    if service in {"telegram", "max", "imo"}:
+    if service in {"telegram_reg", "telegram_noreg", "max", "imo"}:
         now = int(time.time())
-        cur = db.conn.execute("UPDATE numbers SET status='rejected',updated_at=? WHERE status='pending' AND service=?", (now, service))
+        if service in {"telegram_reg", "telegram_noreg"}:
+            tg_type = "reg" if service == "telegram_reg" else "noreg"
+            cur = db.conn.execute("UPDATE numbers SET status='rejected',updated_at=? WHERE status='pending' AND service='telegram' AND acc_type=?", (now, tg_type))
+        else:
+            cur = db.conn.execute("UPDATE numbers SET status='rejected',updated_at=? WHERE status='pending' AND service=?", (now, service))
         db.conn.commit()
         cleared = int(cur.rowcount or 0)
     else:
@@ -1624,11 +1757,14 @@ async def cb_admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await remove_buttons(q)
         return
     if db.is_junior_admin(q.from_user.id):
+        if db.junior_is_paused(q.from_user.id):
+            await q.message.reply_text("⏸ Ваш доступ приостановлен старшим админом.")
+            return
         admin_price = db.junior_admin_price(q.from_user.id, r["acc_type"])
         if admin_price <= 0:
             await q.message.reply_text("❌ У вас не настроен прайс. Обратитесь к старшему админу.")
             return
-        if db.junior_treasury_balance(q.from_user.id) < admin_price:
+        if db.junior_treasury_mode(q.from_user.id) == "moment" and db.junior_treasury_balance(q.from_user.id) < admin_price:
             await q.message.reply_text("❌ Недостаточно средств в вашей казне для успешного закрытия номера.")
             return
     if not db.try_take_number(num_id, q.from_user.id):
@@ -1667,9 +1803,15 @@ async def cb_admin_ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     num_id = int(q.data.split(":")[1])
     r = db.get_number(num_id)
-    if not r or r["status"] not in ("in_work", "waiting_code"):
+    if not r or r["status"] not in ("in_work", "waiting_code", "awaiting_admin"):
         await remove_buttons(q)
         return
+    if r["acc_type"] == "max" and r["status"] == "awaiting_admin":
+        if int(r["max_retry_used"] or 0) >= 1:
+            await q.message.reply_text("Для MAX повторный запрос кода уже использован.")
+            return
+        db.conn.execute("UPDATE numbers SET max_retry_used=1,updated_at=? WHERE id=?", (int(time.time()), num_id))
+        db.conn.commit()
     db.set_code_request(num_id, "код с аккаунта" if r["acc_type"] == "reg" else "код с звонка")
     await remove_buttons(q)
     await context.bot.send_message(
@@ -1806,7 +1948,8 @@ async def _finalize_and_notify(context: ContextTypes.DEFAULT_TYPE, q, num_id: in
         if taken_by and db.is_junior_admin(taken_by) and not is_senior_admin(taken_by):
             admin_price = db.junior_admin_price(taken_by, r["acc_type"])
             if admin_price > 0:
-                db.sub_junior_treasury_balance(taken_by, admin_price)
+                if db.junior_treasury_mode(taken_by) == "moment":
+                    db.sub_junior_treasury_balance(taken_by, admin_price)
                 db.add_prepaid_junior_balance(r["user_id"], price)
                 diff = max(0.0, admin_price - price)
                 if diff > 0:
@@ -1821,6 +1964,7 @@ async def _finalize_and_notify(context: ContextTypes.DEFAULT_TYPE, q, num_id: in
                 db.conn.execute("UPDATE users SET referral_earned=referral_earned+? WHERE user_id=?", (ref_amount, u["referrer_id"]))
                 db.conn.commit()
                 await context.bot.send_message(u["referrer_id"], f"🎁 Реферальный бонус +${ref_amount:.2f} за сдачу номера вашим рефералом.")
+        db.block_phone(r["phone"], int(q.from_user.id or 0), r["service"] if "service" in r.keys() else "telegram")
         await context.bot.send_message(r["user_id"], f"✅ Номер {r['phone']} успешно подтвержден. +${price:.2f} зачислено на баланс.")
         await q.message.reply_text("Успешно закрыто. Баланс пользователю начислен.")
     else:
@@ -1830,8 +1974,11 @@ async def _finalize_and_notify(context: ContextTypes.DEFAULT_TYPE, q, num_id: in
 
 async def show_block_menu(update: Update):
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Заблокировать", callback_data="blockmenu:block")],
-        [InlineKeyboardButton("Разблокировать", callback_data="blockmenu:unblock")],
+        [InlineKeyboardButton("📋 Все блоки", callback_data="blockmenu:list:all:0")],
+        [InlineKeyboardButton("Telegram", callback_data="blockmenu:list:telegram:0"), InlineKeyboardButton("MAX", callback_data="blockmenu:list:max:0")],
+        [InlineKeyboardButton("IMO", callback_data="blockmenu:list:imo:0")],
+        [InlineKeyboardButton("🔎 Поиск номера", callback_data="blockmenu:search")],
+        [InlineKeyboardButton("➕ Заблокировать из последних", callback_data="blockmenu:block")],
     ])
     await update.message.reply_text("🔒 Управление блокировкой номеров", reply_markup=kb)
 
@@ -1841,24 +1988,42 @@ async def cb_block_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not has_admin_access(q.from_user.id, "block"):
         return
-    mode = q.data.split(":")[1]
+    parts = q.data.split(":")
+    mode = parts[1]
     if mode == "block":
-        rows = db.recent_taken_numbers(10)
+        rows = db.recent_taken_numbers(25)
         if not rows:
             await q.message.reply_text("Нет недавно взятых номеров.")
             return
-        kb = [[InlineKeyboardButton(f"{r['phone']}", callback_data=f"blockpick:{r['id']}")] for r in rows]
+        kb = [[InlineKeyboardButton(f"{r['phone']} ({service_label(r['service'])})", callback_data=f"blockpick:{r['id']}")] for r in rows]
         await q.message.reply_text("Выберите номер для блокировки:", reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        rows = db.blocked_phones()
+        return
+    if mode == "search":
+        context.user_data["block_search_mode"] = True
+        await q.message.reply_text("Введите номер для поиска/разблокировки:")
+        return
+    if mode == "list":
+        service = parts[2] if len(parts) > 2 else "all"
+        page = int(parts[3]) if len(parts) > 3 else 0
+        svc = None if service == "all" else service
+        per = 10
+        total = db.blocked_phones_count(svc)
+        rows = db.blocked_phones(svc, per, page * per)
         if not rows:
             await q.message.reply_text("Список блокировок пуст.")
             return
-        kb, lines = [], ["Заблокированные номера:"]
-        for r in rows[:30]:
+        kb, lines = [], [f"Заблокированные номера (стр. {page + 1}):"]
+        for r in rows:
             dt = datetime.fromtimestamp(int(r["created_at"] or 0)).strftime("%d.%m %H:%M")
-            lines.append(f"• {r['phone']} ({dt})")
-            kb.append([InlineKeyboardButton(f"🔓 {r['phone']}", callback_data=f"unblock:{r['phone']}")])
+            lines.append(f"• {r['phone']} | {service_label(r['service'])} ({dt})")
+            kb.append([InlineKeyboardButton(f"🔓 {r['phone']} ({service_label(r['service'])})", callback_data=f"unblock:{r['phone']}:{r['service']}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"blockmenu:list:{service}:{page-1}"))
+        if (page + 1) * per < total:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"blockmenu:list:{service}:{page+1}"))
+        if nav:
+            kb.append(nav)
         await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -1887,7 +2052,7 @@ async def cb_block_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = db.get_number(int(raw_id))
     if not r:
         return
-    db.block_phone(r["phone"], q.from_user.id)
+    db.block_phone(r["phone"], q.from_user.id, r["service"] if "service" in r.keys() else "telegram")
     await q.message.reply_text(f"🔒 Номер {r['phone']} заблокирован.")
 
 
@@ -1896,9 +2061,21 @@ async def cb_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not has_admin_access(q.from_user.id, "block"):
         return
-    phone = q.data.split(":", 1)[1]
-    db.unblock_phone(phone)
+    parts = q.data.split(":")
+    phone = parts[1]
+    service = parts[2] if len(parts) > 2 else None
+    db.unblock_phone(phone, service)
     await q.message.reply_text(f"🔓 Номер {phone} разблокирован.")
+
+
+async def cb_block_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not has_admin_access(q.from_user.id, "block"):
+        return
+    _, phone, service = q.data.split(":")
+    db.block_phone(phone, q.from_user.id, service)
+    await q.message.reply_text(f"🔒 Номер {phone} заблокирован для {service_label(service)}.")
 
 
 async def show_admin_users_menu(update: Update):
@@ -1979,6 +2156,29 @@ async def admin_user_search_input(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def admin_number_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if has_admin_access(update.effective_user.id, "block") and context.user_data.get("block_search_mode"):
+        raw = (update.message.text or "").strip()
+        context.user_data.pop("block_search_mode", None)
+        phone = normalize_phone(raw)
+        if not phone:
+            await update.message.reply_text("Введите корректный номер РФ формата +79XXXXXXXXX")
+            return
+        rows = db.conn.execute("SELECT * FROM blocked_numbers_v2 WHERE phone=? ORDER BY created_at DESC", (phone,)).fetchall()
+        kb = []
+        lines = [f"Номер: {phone}"]
+        present = {r['service'] for r in rows}
+        if rows:
+            lines.append("Сейчас заблокирован в:")
+            for r in rows:
+                lines.append(f"• {service_label(r['service'])}")
+                kb.append([InlineKeyboardButton(f"🔓 Разблокировать {service_label(r['service'])}", callback_data=f"unblock:{phone}:{r['service']}")])
+        else:
+            lines.append("Сейчас не находится в блокировках.")
+        for svc in ("telegram", "max", "imo"):
+            if svc not in present:
+                kb.append([InlineKeyboardButton(f"🔒 Заблокировать {service_label(svc)}", callback_data=f"blockdirect:{phone}:{svc}")])
+        await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+        return
     if not has_admin_access(update.effective_user.id, "users") or not context.user_data.get("number_search_mode"):
         return
     raw = (update.message.text or "").strip()
@@ -2131,13 +2331,22 @@ async def show_admin_stats(update: Update):
         f"Топ админ (24ч): {top_line}",
         "",
     ]
-    for service in ("telegram", "max", "imo"):
-        ok_total, bad_total = db.service_stats_total(service)
-        ok_day, bad_day = db.service_stats_day(service)
-        top_admin_total = db.service_top_admin(service, day=False)
-        top_user_total = db.service_top_user(service, day=False)
-        top_admin_day = db.service_top_admin(service, day=True)
-        top_user_day = db.service_top_user(service, day=True)
+    for service in ("telegram_reg", "telegram_noreg", "max", "imo"):
+        stat_service = "telegram" if service in {"telegram_reg", "telegram_noreg"} else service
+        if service in {"telegram_reg", "telegram_noreg"}:
+            tg_type = "reg" if service == "telegram_reg" else "noreg"
+            ok_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE service='telegram' AND acc_type=? AND status='success'", (tg_type,)).fetchone()["c"])
+            bad_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE service='telegram' AND acc_type=? AND status IN ('fail','rejected')", (tg_type,)).fetchone()["c"])
+            since = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+            ok_day = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE service='telegram' AND acc_type=? AND status='success' AND updated_at>=?", (tg_type, since)).fetchone()["c"])
+            bad_day = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE service='telegram' AND acc_type=? AND status IN ('fail','rejected') AND updated_at>=?", (tg_type, since)).fetchone()["c"])
+        else:
+            ok_total, bad_total = db.service_stats_total(service)
+            ok_day, bad_day = db.service_stats_day(service)
+        top_admin_total = db.service_top_admin(stat_service, day=False)
+        top_user_total = db.service_top_user(stat_service, day=False)
+        top_admin_day = db.service_top_admin(stat_service, day=True)
+        top_user_day = db.service_top_user(stat_service, day=True)
         lines.extend([
             f"📦 {SERVICE_LABELS[service]}",
             f"Всего успешно/неуспешно: {ok_total}/{bad_total}",
@@ -2148,6 +2357,90 @@ async def show_admin_stats(update: Update):
             f"Лучший пользователь (24ч): @{top_user_day['username'] or top_user_day['user_id']} — {int(top_user_day['c'])}" if top_user_day else "Лучший пользователь (24ч): -",
             "",
         ])
+    await update.message.reply_text("\n".join(lines))
+
+
+async def show_bot_full_stats(update: Update):
+    total_users = int(db.conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"])
+    banned_users = int(db.conn.execute("SELECT COUNT(*) c FROM users WHERE banned=1").fetchone()["c"])
+    vip_users = int(db.conn.execute("SELECT COUNT(*) c FROM users WHERE vip_until>?", (int(time.time()),)).fetchone()["c"])
+    juniors_total = int(db.conn.execute("SELECT COUNT(*) c FROM admin_roles WHERE is_junior=1").fetchone()["c"])
+    juniors_paused = int(db.conn.execute("SELECT COUNT(*) c FROM admin_roles WHERE is_junior=1 AND is_paused=1").fetchone()["c"])
+
+    numbers_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers").fetchone()["c"])
+    pending_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='pending'").fetchone()["c"])
+    inwork_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status IN ('in_work','waiting_code','awaiting_admin','awaiting_user_exit','awaiting_exit_confirm')").fetchone()["c"])
+    success_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='success'").fetchone()["c"])
+    fail_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status IN ('fail','rejected')").fetchone()["c"])
+
+    since = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+    day_total = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE updated_at>=?", (since,)).fetchone()["c"])
+    day_success = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status='success' AND updated_at>=?", (since,)).fetchone()["c"])
+    day_fail = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE status IN ('fail','rejected') AND updated_at>=?", (since,)).fetchone()["c"])
+
+    q_tg_reg = db.pending_count("telegram_reg")
+    q_tg_noreg = db.pending_count("telegram_noreg")
+    q_max = db.pending_count("max")
+    q_imo = db.pending_count("imo")
+
+    blocked_total = db.blocked_phones_count()
+    blocked_tg = db.blocked_phones_count("telegram")
+    blocked_max = db.blocked_phones_count("max")
+    blocked_imo = db.blocked_phones_count("imo")
+
+    payouts_done = int(db.conn.execute("SELECT COUNT(*) c FROM payouts WHERE status='done'").fetchone()["c"])
+    payouts_processing = int(db.conn.execute("SELECT COUNT(*) c FROM payouts WHERE status='processing'").fetchone()["c"])
+
+    treasury = float(db.get_treasury_balance())
+    users_balance = float(db.sum_all_user_balances())
+    free_funds = treasury - users_balance
+
+    lines = [
+        "📊 Полная статистика бота",
+        "",
+        "👥 Пользователи",
+        f"Всего: {total_users}",
+        f"Забанено: {banned_users}",
+        f"VIP активных: {vip_users}",
+        "",
+        "👮 Админы",
+        f"Старших: {len(SENIOR_ADMIN_IDS)}",
+        f"Младших: {juniors_total}",
+        f"Младших на паузе: {juniors_paused}",
+        "",
+        "📦 Номера (всего)",
+        f"Всего: {numbers_total}",
+        f"Pending: {pending_total}",
+        f"В работе: {inwork_total}",
+        f"Успешно: {success_total}",
+        f"Неуспешно: {fail_total}",
+        "",
+        "🕒 Номера (24ч)",
+        f"Всего: {day_total}",
+        f"Успешно: {day_success}",
+        f"Неуспешно: {day_fail}",
+        "",
+        "🧵 Очереди",
+        f"Telegram REG: {q_tg_reg}",
+        f"Telegram NOREG: {q_tg_noreg}",
+        f"MAX: {q_max}",
+        f"IMO: {q_imo}",
+        "",
+        "🔒 Блоки номеров",
+        f"Всего: {blocked_total}",
+        f"Telegram: {blocked_tg}",
+        f"MAX: {blocked_max}",
+        f"IMO: {blocked_imo}",
+        "",
+        "💸 Выплаты",
+        f"Завершено: {payouts_done}",
+        f"В обработке: {payouts_processing}",
+        "",
+        "🏦 Финансы",
+        f"Казна: ${treasury:.2f}",
+        f"Сумма балансов пользователей: ${users_balance:.2f}",
+        f"Свободные средства: ${free_funds:.2f}",
+    ]
     await update.message.reply_text("\n".join(lines))
 
 
@@ -2194,10 +2487,26 @@ async def cb_admins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = db.user_row(aid)
         ok_total, bad_total = db.admin_stats_total(aid)
         ok_day, bad_day = db.admin_stats_day(aid)
+        in_work = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND status IN ('in_work','waiting_code','awaiting_admin','awaiting_user_exit','awaiting_exit_confirm')", (aid,)).fetchone()["c"])
+        pending_taken = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND status='pending'", (aid,)).fetchone()["c"])
+        since = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+        svc_lines = []
+        for svc, label in (("telegram", "TG"), ("max", "MAX"), ("imo", "IMO")):
+            s_ok = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND service=? AND status='success'", (aid, svc)).fetchone()["c"])
+            s_bad = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND service=? AND status IN ('fail','rejected')", (aid, svc)).fetchone()["c"])
+            d_ok = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND service=? AND status='success' AND updated_at>=?", (aid, svc, since)).fetchone()["c"])
+            d_bad = int(db.conn.execute("SELECT COUNT(*) c FROM numbers WHERE taken_by=? AND service=? AND status IN ('fail','rejected') AND updated_at>=?", (aid, svc, since)).fetchone()["c"])
+            svc_lines.append(f"{label}: {s_ok}/{s_bad} (24ч {d_ok}/{d_bad})")
+        total_done = ok_total + bad_total
+        success_pct = (ok_total / total_done * 100) if total_done else 0.0
         kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"admins:view:{aid}")],
             [InlineKeyboardButton("🗑 Удалить админа", callback_data=f"admins:del:{aid}")],
             [InlineKeyboardButton("💵 Изм. прайс", callback_data=f"admins:price:{aid}")],
             [InlineKeyboardButton("🔐 Изменить доступ", callback_data=f"admins:access:{aid}")],
+            [InlineKeyboardButton("➕ Добавить баланс", callback_data=f"admins:tadd:{aid}"), InlineKeyboardButton("➖ Удалить баланс", callback_data=f"admins:tsub:{aid}")],
+            [InlineKeyboardButton("⏯ Приостановить/продолжить", callback_data=f"admins:pause:{aid}")],
+            [InlineKeyboardButton("💼 Холд/момент", callback_data=f"admins:mode:{aid}")],
             [InlineKeyboardButton("📱 Номера", callback_data=f"admins:numbers:{aid}")],
         ])
         await q.message.reply_text(
@@ -2206,10 +2515,17 @@ async def cb_admins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Не успешно всего: {bad_total}\n"
             f"Успешно за 24ч: {ok_day}\n"
             f"Не успешно за 24ч: {bad_day}\n"
+            f"Конверсия: {success_pct:.1f}%\n"
+            f"Сейчас в работе: {in_work}\n"
+            f"Pending на админе: {pending_taken}\n"
+            f"По сервисам (успех/неуспех, 24ч):\n• " + "\n• ".join(svc_lines) + "\n"
             f"Казна: ${float(row['treasury_balance']):.2f}\n"
             f"Прайс TG REG/NOREG: ${float(row['reg_price']):.2f}/${float(row['noreg_price']):.2f}\n"
             f"Прайс MAX/IMO: ${float(row['max_price']):.2f}/${float(row['imo_price']):.2f}\n"
-            f"Прибыль от админа: ${db.junior_profit_live(aid):.2f}",
+            f"Режим казны: {'HOLD' if db.junior_treasury_mode(aid) == 'hold' else 'MOMENT'}\n"
+            f"Статус: {'⏸ Приостановлен' if db.junior_is_paused(aid) else '▶️ Активен'}\n"
+            f"Прибыль от админа: ${db.junior_profit_live(aid):.2f}\n"
+            f"Прибыль от админа 24ч: ${db.junior_profit_day(aid):.2f}",
             reply_markup=kb,
         )
     elif action == "del":
@@ -2220,6 +2536,19 @@ async def cb_admins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = int(parts[2])
         context.user_data["junior_price_mode"] = aid
         await q.message.reply_text("Введите новый прайс TG_REG TG_NOREG MAX IMO через пробел. Пример: 1.40 1.30 1.20 1.10")
+    elif action in {"tadd", "tsub"}:
+        aid = int(parts[2])
+        context.user_data["junior_treasury_manage"] = (action, aid)
+        await q.message.reply_text("Введите сумму в $:")
+    elif action == "pause":
+        aid = int(parts[2])
+        db.set_junior_paused(aid, not db.junior_is_paused(aid))
+        await q.message.reply_text("Статус младшего админа обновлен ✅")
+    elif action == "mode":
+        aid = int(parts[2])
+        new_mode = "hold" if db.junior_treasury_mode(aid) == "moment" else "moment"
+        db.set_junior_treasury_mode(aid, new_mode)
+        await q.message.reply_text(f"Режим казны переключен: {'HOLD' if new_mode == 'hold' else 'MOMENT'}")
     elif action == "access":
         aid = int(parts[2])
         await q.message.reply_text(_junior_access_text(aid), reply_markup=_junior_access_keyboard(aid))
@@ -2328,6 +2657,46 @@ async def admin_junior_price_input(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text("Прайс младшего админа обновлен ✅")
 
 
+async def admin_junior_treasury_manage_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_access(update.effective_user.id, "admins") or "junior_treasury_manage" not in context.user_data:
+        return
+    try:
+        amount = float((update.message.text or "").replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Нужно число.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("Сумма должна быть > 0")
+        return
+    action, aid = context.user_data.pop("junior_treasury_manage")
+    if action == "tadd":
+        db.add_junior_treasury_balance(aid, amount)
+        await update.message.reply_text("Баланс казны админа пополнен ✅")
+    else:
+        db.sub_junior_treasury_balance(aid, amount)
+        await update.message.reply_text("Баланс казны админа уменьшен ✅")
+
+
+async def admin_junior_hold_topup_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_junior_admin(update.effective_user.id) or is_senior_admin(update.effective_user.id) or not context.user_data.get("junior_hold_topup_mode"):
+        return
+    raw = (update.message.text or "").strip()
+    if is_menu_command_text(raw):
+        context.user_data.pop("junior_hold_topup_mode", None)
+        return
+    try:
+        amount = float(raw.replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Введите корректную сумму.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("Сумма должна быть больше 0.")
+        return
+    db.add_junior_treasury_balance(update.effective_user.id, amount)
+    context.user_data.pop("junior_hold_topup_mode", None)
+    await update.message.reply_text(f"Казна пополнена на ${amount:.2f} ✅")
+
+
 async def show_work_menu(update: Update):
     global_state = "🟢 WORK" if db.work_enabled() else "🔴 STOP WORK"
     kb = InlineKeyboardMarkup([
@@ -2378,6 +2747,7 @@ async def show_treasury_menu(update: Update):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("💳 Пополнить казну", callback_data="treasury:topup")],
             [InlineKeyboardButton("✅ Проверить пополнение", callback_data="treasury:check")],
+            [InlineKeyboardButton("➕ Пополнить вручную", callback_data="treasury:holdtopup")],
         ])
         await update.message.reply_text(
             "🏦 <b>Казна младшего админа</b>\n"
@@ -2455,6 +2825,10 @@ async def cb_treasury_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await q.message.reply_text(f"Проверка завершена. Оплачено счетов: {paid}. Ваша казна: {db.junior_treasury_balance(q.from_user.id):.2f} USDT")
             except Exception as e:
                 await q.message.reply_text(f"Ошибка при проверке пополнения: {e}")
+            return
+        if action == "holdtopup":
+            context.user_data["junior_hold_topup_mode"] = True
+            await q.message.reply_text("Введите сумму, на которую хотите пополнить казну:")
             return
         await q.message.reply_text("Для младшего админа доступно только пополнение и проверка пополнения казны.")
         return
@@ -2547,8 +2921,7 @@ async def admin_treasury_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not has_admin_access(update.effective_user.id, "treasury") or not context.user_data.get("treasury_topup_mode"):
         return
     raw = (update.message.text or "").strip()
-    menu_texts = {"📲 Сдать номер", "📋 Мои номера", "💰 Баланс", "📊 Статистика", "👥 Рефералка", "🛠 Номера", "👥 Пользователи", "💵 Цена", "📈 Админ-статистика", "⏯ Старт/Стоп ворк", "📣 Рассылка", "🏦 Казна", "💸 Выплаты", "🔒 Блок номера", "👮 Админы", "💎 VIP"}
-    if raw in menu_texts:
+    if is_menu_command_text(raw):
         context.user_data.pop("treasury_topup_mode", None)
         context.user_data.pop("treasury_withdraw_mode", None)
         return
@@ -2591,6 +2964,9 @@ async def admin_mailing_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not has_admin_access(update.effective_user.id, "mailing") or not context.user_data.get("mailing_mode"):
         return
     text = (update.message.text or "").strip()
+    if is_menu_command_text(text):
+        context.user_data.pop("mailing_mode", None)
+        return
     if text.lower() in {"отмена", "cancel"}:
         context.user_data.pop("mailing_mode", None)
         await update.message.reply_text("Рассылка отменена.")
@@ -2601,7 +2977,7 @@ async def admin_mailing_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     sent = failed = 0
     for uid in db.all_user_ids():
         try:
-            await context.bot.send_message(uid, f"📣 <b>Сообщение от администрации</b>\n\n{text}", parse_mode=ParseMode.HTML)
+            await context.bot.send_message(uid, text)
             sent += 1
         except Exception:
             failed += 1
@@ -2749,6 +3125,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_block_menu, pattern=r"^blockmenu:"))
     app.add_handler(CallbackQueryHandler(cb_block_pick, pattern=r"^blockpick:"))
     app.add_handler(CallbackQueryHandler(cb_block_confirm, pattern=r"^blockconfirm:"))
+    app.add_handler(CallbackQueryHandler(cb_block_direct, pattern=r"^blockdirect:"))
     app.add_handler(CallbackQueryHandler(cb_unblock, pattern=r"^unblock:"))
 
     app.add_handler(CallbackQueryHandler(cb_users_menu, pattern=r"^usersmenu:"))
@@ -2777,11 +3154,13 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_number_search_input), group=6)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_junior_add_input), group=7)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_junior_price_input), group=8)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_add_input), group=9)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_price_input), group=10)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_user_text), group=11)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_junior_treasury_manage_input), group=9)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_junior_hold_topup_input), group=10)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_add_input), group=11)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_price_input), group=12)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_user_text), group=13)
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router), group=12)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router), group=14)
     return app
 
 
